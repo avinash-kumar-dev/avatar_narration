@@ -1,0 +1,8 @@
+node_modules
+.env
+data/
+*.mp4
+*.mp3
+*.wav
+*.pcm
+*.webm

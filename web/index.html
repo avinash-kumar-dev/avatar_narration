@@ -1,0 +1,20 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>avatar-narration render page</title>
+    <style>
+      html, body { margin: 0; background: #000; }
+      #stage { width: 1280px; height: 720px; }
+    </style>
+  </head>
+  <body>
+    <div id="stage"></div>
+    <!-- Real click target: Direct Mode's initializeAudioContext() must run
+         inside a user-interaction handler (browser autoplay policy). The
+         server dispatches a genuine Playwright click on this button. -->
+    <button id="start-btn" style="position:fixed;top:0;left:0">start</button>
+    <p id="status">loading</p>
+    <script type="module" src="/main.ts"></script>
+  </body>
+</html>
