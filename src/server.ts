@@ -6,7 +6,15 @@ import multipart from '@fastify/multipart'
 import Fastify from 'fastify'
 import { config } from './config.js'
 import { JobManager, QueueFullError } from './jobs.js'
-import { BYTES_PER_SECOND, decodeToPcm16, preflightBrowser, startWebServer, stopWebServer } from './render.js'
+import {
+  BYTES_PER_SECOND,
+  TRANSPARENT,
+  decodeToPcm16,
+  preflightBrowser,
+  startWebServer,
+  stopWebServer,
+  type VideoFormat,
+} from './render.js'
 
 const DEFAULT_BACKGROUND = '#ffffff'
 const MIN_AUDIO_SECONDS = 0.5
@@ -68,7 +76,8 @@ app.get('/health', async () => ({ ok: true, ...jobs.stats() }))
 /**
  * Submit a narration. multipart/form-data:
  *   audio       (file, required)  any format ffmpeg reads
- *   background  (text, optional)  #rrggbb, default #ffffff
+ *   background  (text, optional)  #rrggbb, default #ffffff, or `transparent`
+ *                                 (RENDER_MODE=stepped only; outputs WebM + MOV instead of MP4)
  * Responds 202 immediately; poll GET /jobs/:id.
  */
 app.post('/jobs', async (req, reply) => {
@@ -99,8 +108,13 @@ app.post('/jobs', async (req, reply) => {
     }
 
     if (!gotAudio) throw new HttpError(400, 'missing_audio', 'multipart field "audio" (a file) is required')
-    if (!/^#[0-9a-fA-F]{6}$/.test(background)) {
-      throw new HttpError(400, 'invalid_background', 'background must be a #rrggbb hex color')
+    if (background === TRANSPARENT) {
+      // Realtime mode records through MediaRecorder, which cannot keep alpha.
+      if (config.renderMode !== 'stepped') {
+        throw new HttpError(400, 'invalid_background', 'a transparent background needs RENDER_MODE=stepped')
+      }
+    } else if (!/^#[0-9a-fA-F]{6}$/.test(background)) {
+      throw new HttpError(400, 'invalid_background', 'background must be a #rrggbb hex color or "transparent"')
     }
 
     // Decoding doubles as validation: not audio, or unreadable, fails here
@@ -139,17 +153,27 @@ app.get<{ Params: { id: string } }>('/jobs/:id', async (req) => {
   return jobs.toPublic(job)
 })
 
-/** Streams the MP4, with Range support so it can be played/seeked in a <video> tag. */
-app.get<{ Params: { id: string } }>('/jobs/:id/video', async (req, reply) => {
+const CONTENT_TYPES: Record<VideoFormat, string> = { mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime' }
+
+/**
+ * Streams a produced video, with Range support so it can be played/seeked in
+ * a <video> tag. `?format=` picks one of the job's `videos`; default is the first.
+ */
+app.get<{ Params: { id: string }; Querystring: { format?: string } }>('/jobs/:id/video', async (req, reply) => {
   const job = jobs.get(req.params.id)
   if (!job) throw new HttpError(404, 'not_found', 'no such job')
   if (job.status !== 'succeeded') throw new HttpError(409, 'not_ready', `job is ${job.status}`)
 
-  const { size } = await stat(job.videoPath)
-  reply.header('Content-Type', 'video/mp4').header('Accept-Ranges', 'bytes')
+  const formats = Object.keys(job.videos) as VideoFormat[]
+  const format = (req.query.format ?? formats[0]) as VideoFormat
+  const path = job.videos[format]
+  if (!path) throw new HttpError(404, 'not_found', `no ${format} video for this job (available: ${formats.join(', ')})`)
+
+  const { size } = await stat(path)
+  reply.header('Content-Type', CONTENT_TYPES[format]).header('Accept-Ranges', 'bytes')
 
   const range = req.headers.range
-  if (!range) return reply.header('Content-Length', size).send(createReadStream(job.videoPath))
+  if (!range) return reply.header('Content-Length', size).send(createReadStream(path))
 
   const m = /^bytes=(\d*)-(\d*)$/.exec(range)
   let start = m?.[1] ? Number(m[1]) : NaN
@@ -171,7 +195,7 @@ app.get<{ Params: { id: string } }>('/jobs/:id/video', async (req, reply) => {
     .code(206)
     .header('Content-Range', `bytes ${start}-${end}/${size}`)
     .header('Content-Length', end - start + 1)
-    .send(createReadStream(job.videoPath, { start, end }))
+    .send(createReadStream(path, { start, end }))
 })
 
 /** Cancels a queued/running job, or deletes a finished job and its MP4. */

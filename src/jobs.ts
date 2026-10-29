@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { mkdir, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { config } from './config.js'
-import { RenderError, jobTimeoutMs, renderVideo } from './render.js'
+import { RenderError, jobTimeoutMs, renderVideo, type RenderOutputs, type VideoFormat } from './render.js'
 
 export type JobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled'
 
@@ -28,6 +28,8 @@ interface Job {
   dir: string
   pcmPath: string
   videoPath: string
+  /** Files produced by a successful render, keyed by format. */
+  videos: RenderOutputs
   abort?: AbortController
   /** Why the abort happened, so a timeout is not reported as a generic failure. */
   abortReason?: 'timeout' | 'cancelled' | 'shutdown'
@@ -45,7 +47,10 @@ export interface PublicJob {
   finishedAt?: string
   error?: string
   errorCode?: string
+  /** The default download (first entry of `videos`). */
   videoUrl?: string
+  /** Every produced format: `mp4`, or `webm` and `mov` for a transparent background. */
+  videos?: Partial<Record<VideoFormat, string>>
 }
 
 export class QueueFullError extends Error {}
@@ -105,6 +110,7 @@ export class JobManager {
       progress: null,
       createdAt: Date.now(),
       videoPath: join(args.dir, 'narration.mp4'),
+      videos: {},
     }
     this.jobs.set(job.id, job)
     this.queue.push(job.id)
@@ -118,6 +124,9 @@ export class JobManager {
   }
 
   toPublic(job: Job): PublicJob {
+    const succeeded = job.status === 'succeeded'
+    const formats = Object.keys(job.videos) as VideoFormat[]
+    const urls = Object.fromEntries(formats.map((f) => [f, `/jobs/${job.id}/video?format=${f}`]))
     return {
       id: job.id,
       status: job.status,
@@ -130,7 +139,8 @@ export class JobManager {
       finishedAt: iso(job.finishedAt),
       error: job.error,
       errorCode: job.errorCode,
-      videoUrl: job.status === 'succeeded' ? `/jobs/${job.id}/video` : undefined,
+      videoUrl: succeeded ? `/jobs/${job.id}/video` : undefined,
+      videos: succeeded ? urls : undefined,
     }
   }
 
@@ -192,7 +202,7 @@ export class JobManager {
 
     this.log.info(`job ${job.id} started`)
     try {
-      await renderVideo({
+      job.videos = await renderVideo({
         pcmPath: job.pcmPath,
         outPath: job.videoPath,
         background: job.background,

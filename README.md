@@ -1,6 +1,6 @@
 # avatar-narration
 
-HTTP service: upload narration audio, get back an MP4 of a Spatius avatar speaking it (synced lipsync, solid background).
+HTTP service: upload narration audio, get back a video of a Spatius avatar speaking it (synced lipsync). Solid-color background (MP4) or transparent background (WebM + MOV).
 
 ## Architecture
 
@@ -17,17 +17,19 @@ POST /jobs (audio file)
       │    (connects to Spatius Direct Mode, plays the audio,
       │     captures avatar frames)
       │
-      └─ ffmpeg encodes the captured frames + audio → MP4
+      └─ ffmpeg encodes the captured frames + audio
+           → MP4 (solid background)
+           → WebM + MOV with alpha (transparent background)
 
-GET /jobs/:id        → poll status
-GET /jobs/:id/video  → download the MP4
+GET /jobs/:id                      → poll status
+GET /jobs/:id/video?format=<fmt>   → download (mp4 | webm | mov)
 ```
 
 No LiveKit, no separate avatar server, no text-to-speech — you provide the audio.
 
 Two render modes (`RENDER_MODE` env var):
 - `realtime` (default) — records the avatar live while it plays. Needs a GPU.
-- `stepped` — renders one frame at a time, slower but works on a CPU-only host (e.g. a plain Docker container).
+- `stepped` — renders one frame at a time, slower but works on a CPU-only host (e.g. a plain Docker container). Required for a transparent background.
 
 ## Setup
 
@@ -72,6 +74,19 @@ curl http://localhost:3000/jobs/<id>/video -H "Authorization: Bearer $API_KEY" -
 ```
 
 Cancel/delete: `DELETE /jobs/<id>`. Health check (no auth): `GET /health`.
+
+### Transparent background
+
+Send `-F background=transparent` (needs `RENDER_MODE=stepped`). Instead of an MP4 you get two files with a real alpha channel, listed in the job's `videos`:
+
+- `?format=webm` — VP9 WebM: Chrome, Firefox, Edge.
+- `?format=mov` — HEVC-with-alpha MOV: Safari, Apple devices, Final Cut / Premiere / DaVinci on macOS. Only produced when the service runs on macOS (it needs Apple's encoder).
+
+```bash
+curl "http://localhost:3000/jobs/<id>/video?format=webm" -H "Authorization: Bearer $API_KEY" -o out.webm
+```
+
+For a plain MP4 that any editor can key out, use a green background instead: `-F background='#00ff00'`.
 
 ## Running in Docker
 

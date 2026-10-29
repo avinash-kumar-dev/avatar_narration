@@ -15,7 +15,7 @@ import { execFile, spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import ffmpegInstaller from '@ffmpeg-installer/ffmpeg'
@@ -207,13 +207,20 @@ export interface RenderUpdate {
 export interface RenderOptions {
   /** Raw PCM16 mono @16kHz, as produced by decodeToPcm16(). */
   pcmPath: string
+  /** Where the MP4 goes; transparent outputs are written next to it. */
   outPath: string
-  /** `#rrggbb`, painted behind the avatar. */
+  /** `#rrggbb` painted behind the avatar, or `transparent` (stepped mode only). */
   background: string
   signal: AbortSignal
   onUpdate: (u: RenderUpdate) => void
   log: (msg: string) => void
 }
+
+/** Output files of one render, keyed by format (`mp4`, or `webm`/`mov` when transparent). */
+export type RenderOutputs = Partial<Record<VideoFormat, string>>
+export type VideoFormat = 'mp4' | 'webm' | 'mov'
+
+export const TRANSPARENT = 'transparent'
 
 /**
  * Renders one narration. If the avatar fails to load in time it tries once
@@ -223,20 +230,19 @@ export interface RenderOptions {
  * recording) is NOT retried, since repeating it would spend more credits and
  * rarely help.
  */
-export async function renderVideo(opts: RenderOptions): Promise<void> {
+export async function renderVideo(opts: RenderOptions): Promise<RenderOutputs> {
   try {
-    await renderOnce(opts)
+    return await renderOnce(opts)
   } catch (err) {
     if (err instanceof WaitTimeoutError && err.flag === '__directModeAvatarLoaded' && !opts.signal.aborted) {
       opts.log('avatar load timed out, retrying once')
-      await renderOnce(opts)
-      return
+      return await renderOnce(opts)
     }
     throw err
   }
 }
 
-async function renderOnce(opts: RenderOptions): Promise<void> {
+async function renderOnce(opts: RenderOptions): Promise<RenderOutputs> {
   const { pcmPath, outPath, background, signal, onUpdate, log } = opts
   if (!vite) throw new Error('web server not started')
 
@@ -316,8 +322,7 @@ async function renderOnce(opts: RenderOptions): Promise<void> {
     }
 
     if (config.renderMode === 'stepped') {
-      await renderStepped({ page, pcmPath, outPath, background, speechSec, signal, onUpdate, log })
-      return
+      return await renderStepped({ page, pcmPath, outPath, workDir, background, speechSec, signal, onUpdate, log })
     }
 
     // send() returns as soon as the SDK has buffered the audio; playback (and
@@ -376,6 +381,7 @@ async function renderOnce(opts: RenderOptions): Promise<void> {
 
     onUpdate({ stage: 'encoding' })
     await encodeMp4(webmPath, outPath)
+    return { mp4: outPath }
   } catch (err) {
     // Without this a failed render leaves only the one-line error; the
     // browser's own output is what explains a hang or a rejected session.
@@ -402,6 +408,7 @@ interface SteppedArgs {
   page: Page
   pcmPath: string
   outPath: string
+  workDir: string
   background: string
   speechSec: number
   signal: AbortSignal
@@ -416,10 +423,14 @@ interface SteppedArgs {
  * is the avatar at audio time k/25 by construction, so the original audio is
  * muxed in at offset zero.
  */
-async function renderStepped(a: SteppedArgs): Promise<void> {
+async function renderStepped(a: SteppedArgs): Promise<RenderOutputs> {
   const { page, signal, onUpdate, log } = a
   const totalFrames = Math.max(1, Math.floor(a.speechSec * FPS))
-  const encoder = spawnFrameEncoder(a.pcmPath, a.outPath, a.background)
+  const transparent = a.background === TRANSPARENT
+  // Transparent: frames go to a lossless master first, which is then encoded
+  // once per delivery format (each needs a different codec for its alpha).
+  const masterPath = join(a.workDir, 'master.mkv')
+  const encoder = transparent ? spawnFrameEncoder(masterArgs(masterPath)) : spawnFrameEncoder(mp4Args(a.pcmPath, a.outPath, a.background))
 
   let saved = 0
   let maxBytes = 0
@@ -473,24 +484,79 @@ async function renderStepped(a: SteppedArgs): Promise<void> {
     encoder.kill()
     throw err
   }
+
+  if (!transparent) return { mp4: a.outPath }
+  const dir = dirname(a.outPath)
+  const outputs: RenderOutputs = { webm: join(dir, 'narration.webm') }
+  // HEVC-with-alpha needs Apple's VideoToolbox encoder, so only a macOS host can make it.
+  if (process.platform === 'darwin') outputs.mov = join(dir, 'narration.mov')
+  for (const [format, path] of Object.entries(outputs) as [VideoFormat, string][]) {
+    try {
+      await exec(FFMPEG, transparentArgs(format, masterPath, a.pcmPath, path), { maxBuffer: 4 * 1024 * 1024 })
+    } catch (err) {
+      throw new Error(`encoding ${format} failed: ${ffmpegMessage(err)}`)
+    }
+  }
+  return outputs
 }
 
-/** ffmpeg reading PNG frames on stdin, the PCM file as audio, writing the final MP4. */
-function spawnFrameEncoder(pcmPath: string, outPath: string, background: string) {
-  const args = [
+const PNG_PIPE_INPUT = ['-f', 'image2pipe', '-c:v', 'png', '-framerate', String(FPS), '-i', 'pipe:0']
+const PCM_INPUT = (pcmPath: string) => ['-f', 's16le', '-ar', String(SAMPLE_RATE), '-ac', '1', '-i', pcmPath]
+const TAIL_PAD = `tpad=stop_mode=clone:stop_duration=${STEPPED_TAIL_SEC}`
+
+/** PNG frames on stdin + the PCM file, composited onto a solid color, to the final MP4. */
+function mp4Args(pcmPath: string, outPath: string, background: string): string[] {
+  return [
     '-hide_banner', '-loglevel', 'error',
     // Solid background the transparent avatar frames are composited onto.
     '-f', 'lavfi', '-i', `color=c=0x${background.slice(1)}:s=${VIEWPORT.width}x${VIEWPORT.height}:r=${FPS}`,
-    '-f', 'image2pipe', '-c:v', 'png', '-framerate', String(FPS), '-i', 'pipe:0',
-    '-f', 's16le', '-ar', String(SAMPLE_RATE), '-ac', '1', '-i', pcmPath,
+    ...PNG_PIPE_INPUT,
+    ...PCM_INPUT(pcmPath),
     '-filter_complex',
-    `[0:v][1:v]overlay=shortest=1,tpad=stop_mode=clone:stop_duration=${STEPPED_TAIL_SEC},format=yuv420p[v];` +
-      `[2:a]apad=pad_dur=${STEPPED_TAIL_SEC}[a]`,
+    `[0:v][1:v]overlay=shortest=1,${TAIL_PAD},format=yuv420p[v];` + `[2:a]apad=pad_dur=${STEPPED_TAIL_SEC}[a]`,
     '-map', '[v]', '-map', '[a]',
     '-c:v', 'libx264', '-crf', '18', '-r', String(FPS), '-vsync', 'cfr',
     '-c:a', 'aac', '-b:a', '192k',
     '-shortest', '-movflags', '+faststart', '-y', outPath,
   ]
+}
+
+/** PNG frames on stdin to a lossless RGBA master (video only), keeping the avatar's alpha. */
+function masterArgs(masterPath: string): string[] {
+  return [
+    '-hide_banner', '-loglevel', 'error',
+    ...PNG_PIPE_INPUT,
+    '-vf', `${TAIL_PAD},format=bgra`,
+    '-c:v', 'ffv1', '-r', String(FPS), '-vsync', 'cfr', '-y', masterPath,
+  ]
+}
+
+/**
+ * Master + PCM to one transparent delivery file. No single small format
+ * carries alpha everywhere: VP9 WebM covers Chrome/Firefox/Edge, HEVC-with-
+ * alpha MOV covers Safari/Apple devices and most editors on macOS.
+ */
+function transparentArgs(format: VideoFormat, masterPath: string, pcmPath: string, outPath: string): string[] {
+  const codec =
+    format === 'webm'
+      ? // auto-alt-ref must be off or libvpx drops the alpha plane.
+        ['-c:v', 'libvpx-vp9', '-pix_fmt', 'yuva420p', '-crf', '30', '-b:v', '0', '-row-mt', '1',
+          '-deadline', 'good', '-cpu-used', '2', '-auto-alt-ref', '0', '-c:a', 'libopus', '-b:a', '128k']
+      : ['-c:v', 'hevc_videotoolbox', '-pix_fmt', 'bgra', '-alpha_quality', '0.9', '-b:v', '3M', '-tag:v', 'hvc1',
+          '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart']
+  return [
+    '-hide_banner', '-loglevel', 'error',
+    '-i', masterPath,
+    ...PCM_INPUT(pcmPath),
+    '-filter_complex', `[1:a]apad=pad_dur=${STEPPED_TAIL_SEC}[a]`,
+    '-map', '0:v', '-map', '[a]',
+    ...codec,
+    '-shortest', '-y', outPath,
+  ]
+}
+
+/** ffmpeg reading PNG frames on stdin (args from mp4Args/masterArgs). */
+function spawnFrameEncoder(args: string[]) {
   const child = spawn(FFMPEG, args, { stdio: ['pipe', 'ignore', 'pipe'] })
   let stderr = ''
   child.stderr.on('data', (d: Buffer) => {
