@@ -11,6 +11,7 @@
     "start": "tsx src/server.ts",
     "dev": "tsx watch src/server.ts",
     "bench": "tsx scripts/bench.ts",
+    "compose": "tsx scripts/compose.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p web/tsconfig.json",
     "setup:browser": "playwright install chromium"
   },

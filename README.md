@@ -88,6 +88,29 @@ curl "http://localhost:3000/jobs/<id>/video?format=webm" -H "Authorization: Bear
 
 For a plain MP4 that any editor can key out, use a green background instead: `-F background='#00ff00'`.
 
+## Course videos (slides + avatar)
+
+`npm run compose` turns a folder of slides and per-slide audio into one video: each slide full screen, the avatar in a circle in a corner, hard cuts between slides.
+
+```
+<course folder>/
+  slides_png/slide_1.png, slide_2.png, ...
+  audio_en/slide_1.mp3, slide_2.mp3, ...      (or voiceover_per_slide/)
+```
+
+```bash
+# the avatar service must be running only if some avatar videos still have to be made
+API_URL=http://127.0.0.1:3000 API_KEY=$API_KEY npm run compose -- "path/to/course folder"
+```
+
+Steps, each skipped when its output already exists (so a re-run costs nothing):
+
+1. normalizes each audio's loudness → `audio_en_loud/`
+2. renders each avatar video through the service → `avatar_videos_loud/` (spends Spatius credits)
+3. composites and joins the slides → `<folder name>_avatar.mp4` (1920x1080)
+
+Options: `--corner top-right|top-left|bottom-right|bottom-left` (default `top-right`), `--size <circle diameter px>` (default `280`), `--out <file.mp4>`.
+
 ## Running in Docker
 
 ```bash
