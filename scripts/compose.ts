@@ -1,10 +1,15 @@
 /**
  * Builds one narrated course video from a folder of slides + per-slide audio:
- * each slide full screen, the avatar in a circle in a corner, hard cuts
- * between slides.
+ * each slide full screen, the avatar in a corner, hard cuts between slides.
+ *
+ * Two styles:
+ *   circle (default)  white-background avatar cropped into a circle, top-right
+ *   cutout            transparent avatar, only her outline on the slide,
+ *                     standing on the bottom edge, bottom-right
  *
  *   npm run compose -- "task3/AIL_Track (1)"
  *   npm run compose -- <folder> --corner top-left --size 320
+ *   npm run compose -- <folder> --style cutout
  *
  * Expected folder layout (slide numbers pair images with audio):
  *   slides_png/slide_1.png ...
@@ -13,7 +18,8 @@
  * Steps, each skipped when its output already exists:
  *   1. loudness-normalize each audio  -> <audio dir>_loud/
  *   2. render each avatar video through the running avatar-narration
- *      service (API_URL, API_KEY)      -> avatar_videos_loud/
+ *      service (API_URL, API_KEY)      -> avatar_videos_loud/ (circle, MP4)
+ *                                         avatar_videos_transparent/ (cutout, WebM)
  *   3. composite + concatenate         -> <folder name>_avatar.mp4
  * Step 2 spends Spatius credits; avatar videos already on disk are reused,
  * so a folder that has them needs no running service.
@@ -38,22 +44,31 @@ const LOUDNORM = 'loudnorm=I=-16:TP=-3:LRA=11'
 const AUDIO_DIRS = ['audio_en', 'voiceover_per_slide']
 const CORNERS = ['top-right', 'top-left', 'bottom-right', 'bottom-left'] as const
 type Corner = (typeof CORNERS)[number]
+const STYLES = ['circle', 'cutout'] as const
+type Style = (typeof STYLES)[number]
 
 const { values, positionals } = parseArgs({
   allowPositionals: true,
   options: {
-    corner: { type: 'string', default: 'top-right' },
-    /** Circle diameter in output pixels (1920x1080 frame). */
-    size: { type: 'string', default: '280' },
+    style: { type: 'string', default: 'circle' },
+    corner: { type: 'string' },
+    /** Avatar size: the circle diameter (circle) or 280 = the circle's scale (cutout), in 1920x1080 pixels. */
+    size: { type: 'string' },
     out: { type: 'string' },
   },
 })
 
 const folder = positionals[0] ? resolve(positionals[0]) : undefined
-if (!folder) fail('usage: npm run compose -- <course folder> [--corner top-right] [--size 280] [--out file.mp4]')
-const corner = values.corner as Corner
+if (!folder) {
+  fail('usage: npm run compose -- <course folder> [--style circle|cutout] [--corner top-right] [--size 280] [--out file.mp4]')
+}
+const style = values.style as Style
+if (!STYLES.includes(style)) fail(`--style must be one of ${STYLES.join(', ')}`)
+const cutout = style === 'cutout'
+// A cutout's torso ends in a straight cut, which only looks right resting on the frame's bottom edge.
+const corner = (values.corner ?? (cutout ? 'bottom-right' : 'top-right')) as Corner
 if (!CORNERS.includes(corner)) fail(`--corner must be one of ${CORNERS.join(', ')}`)
-const diameter = Number(values.size)
+const diameter = Number(values.size ?? (cutout ? 400 : 280))
 if (!Number.isInteger(diameter) || diameter < 80 || diameter > 1000) fail('--size must be an integer between 80 and 1000')
 
 const apiUrl = (process.env.API_URL ?? 'http://127.0.0.1:3000').replace(/\/$/, '')
@@ -65,7 +80,8 @@ if (!existsSync(slidesDir)) fail(`no slides_png/ in ${folder}`)
 if (!audioDirName) fail(`no audio folder (${AUDIO_DIRS.join(' or ')}) in ${folder}`)
 const audioDir = join(folder, audioDirName)
 const loudDir = join(folder, `${audioDirName}_loud`)
-const avatarDir = join(folder, 'avatar_videos_loud')
+const avatarDir = join(folder, cutout ? 'avatar_videos_transparent' : 'avatar_videos_loud')
+const avatarExt = cutout ? 'webm' : 'mp4'
 const outPath = values.out ? resolve(values.out) : join(folder, `${basename(folder)}_avatar.mp4`)
 
 const slides = await pairSlides()
@@ -87,29 +103,38 @@ for (const s of slides) {
 
 const work = await mkdtemp(join(tmpdir(), 'avatar-compose-'))
 try {
-  const g = geometry()
+  const g = cutout ? cutoutGeometry() : circleGeometry()
   const mask = join(work, 'mask.png')
-  // Antialiased 1px edge, so the circle is not jagged.
-  await ffmpeg([
-    '-f', 'lavfi', '-i', `color=black:s=${g.avW}x${g.avH},format=gray`,
-    '-vf', `geq=lum='255*clip(${g.r}+0.5-hypot(X-${g.cxInAv},Y-${g.cyInAv}),0,1)'`,
-    '-frames:v', '1', mask,
-  ])
+  if (!cutout) {
+    // Antialiased 1px edge, so the circle is not jagged.
+    await ffmpeg([
+      '-f', 'lavfi', '-i', `color=black:s=${g.avW}x${g.avH},format=gray`,
+      '-vf', `geq=lum='255*clip(${g.r}+0.5-hypot(X-${g.cxInAv},Y-${g.cyInAv}),0,1)'`,
+      '-frames:v', '1', mask,
+    ])
+  }
 
   const list: string[] = []
   for (const s of slides) {
     const seconds = await durationOf(s.avatar)
     const seg = join(work, `seg_${s.n}.mp4`)
-    await ffmpeg([
-      '-loop', '1', '-t', String(seconds), '-i', s.slide,
-      '-i', s.avatar,
-      '-loop', '1', '-t', String(seconds), '-i', mask,
-      '-filter_complex',
-      `[0:v]scale=${OUT_W}:${OUT_H},setsar=1,fps=${FPS}[bg];` +
+    const bg = `[0:v]scale=${OUT_W}:${OUT_H},setsar=1,fps=${FPS}[bg];`
+    const place = `[bg][c]overlay=${g.x}:${g.y}:eof_action=endall,format=yuv420p[v]`
+    const avatarInput = cutout
+      ? // ffmpeg's built-in VP9 decoder drops the alpha plane; libvpx keeps it.
+        ['-c:v', 'libvpx-vp9', '-i', s.avatar]
+      : ['-i', s.avatar, '-loop', '1', '-t', String(seconds), '-i', mask]
+    const filter = cutout
+      ? bg + `[1:v]scale=${g.scaledW}:${g.scaledH},format=rgba[c];` + place
+      : bg +
         // The pad keeps the top of the circle round when it reaches above the avatar frame.
         `[1:v]scale=${g.scaledW}:${g.scaledH},pad=${g.avW}:${g.avH}:0:${g.padTop}:white,format=rgba[av];` +
         `[2:v]format=gray,fps=${FPS}[m];[av][m]alphamerge[c];` +
-        `[bg][c]overlay=${g.x}:${g.y}:eof_action=endall,format=yuv420p[v]`,
+        place
+    await ffmpeg([
+      '-loop', '1', '-t', String(seconds), '-i', s.slide,
+      ...avatarInput,
+      '-filter_complex', filter,
       '-map', '[v]', '-map', '1:a',
       '-t', String(seconds),
       '-c:v', 'libx264', '-crf', '18', '-r', String(FPS),
@@ -154,7 +179,7 @@ async function pairSlides(): Promise<Slide[]> {
         slide: join(slidesDir, f),
         audio: join(audioDir, audio),
         loud: join(loudDir, `slide_${n}.mp3`),
-        avatar: join(avatarDir, `slide_${n}.mp4`),
+        avatar: join(avatarDir, `slide_${n}.${avatarExt}`),
       }
     })
     .sort((a, b) => a.n - b.n)
@@ -167,7 +192,7 @@ async function pairSlides(): Promise<Slide[]> {
  * reference: at a 280px circle the 1280x720 avatar is scaled to 518x292 and
  * the circle sits centred on her face, 118px below the top of that frame.
  */
-function geometry() {
+function circleGeometry() {
   const k = diameter / 280
   const r = diameter / 2
   const scaledW = even(518 * k)
@@ -190,6 +215,27 @@ function geometry() {
   }
 }
 
+/**
+ * Cutout placement: the whole transparent 16:9 avatar frame, scaled with the
+ * same proportions as the circle style. Her shoulders span about the middle
+ * 44% of that frame's width, so the corner margin is measured from her, not
+ * from the empty frame edge. Bottom corners rest the torso cut on the frame edge.
+ */
+function cutoutGeometry() {
+  const k = diameter / 280
+  const scaledW = even(518 * k)
+  const scaledH = even(292 * k)
+  const halfBody = 0.22 * scaledW
+  const marginX = 48
+  const marginY = 92
+  const cx = corner.endsWith('right') ? OUT_W - marginX - halfBody : marginX + halfBody
+  return {
+    r: 0, scaledW, scaledH, padTop: 0, avW: scaledW, avH: scaledH, cxInAv: 0, cyInAv: 0,
+    x: Math.round(cx - scaledW / 2),
+    y: corner.startsWith('top') ? marginY : OUT_H - scaledH,
+  }
+}
+
 function even(n: number): number {
   return Math.round(n / 2) * 2
 }
@@ -200,7 +246,7 @@ async function renderAvatar(audioPath: string, outFile: string, label: string): 
   const headers = { Authorization: `Bearer ${apiKey}` }
   const form = new FormData()
   form.set('audio', new Blob([await readFile(audioPath)]), basename(audioPath))
-  form.set('background', '#ffffff')
+  form.set('background', cutout ? 'transparent' : '#ffffff')
 
   for (let attempt = 1; attempt <= 3; attempt++) {
     const submit = await fetch(`${apiUrl}/jobs`, { method: 'POST', headers, body: form }).catch((e: Error) =>
@@ -220,7 +266,7 @@ async function renderAvatar(audioPath: string, outFile: string, label: string): 
     process.stdout.write('\n')
 
     if (status.status === 'succeeded') {
-      const video = await fetch(`${apiUrl}/jobs/${job.id}/video?format=mp4`, { headers })
+      const video = await fetch(`${apiUrl}/jobs/${job.id}/video?format=${avatarExt}`, { headers })
       if (!video.ok) fail(`${label}: download failed (${video.status})`)
       await writeFile(outFile, Buffer.from(await video.arrayBuffer()))
       return

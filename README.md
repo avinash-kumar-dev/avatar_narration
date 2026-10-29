@@ -109,7 +109,11 @@ Steps, each skipped when its output already exists (so a re-run costs nothing):
 2. renders each avatar video through the service → `avatar_videos_loud/` (spends Spatius credits)
 3. composites and joins the slides → `<folder name>_avatar.mp4` (1920x1080)
 
-Options: `--corner top-right|top-left|bottom-right|bottom-left` (default `top-right`), `--size <circle diameter px>` (default `280`), `--out <file.mp4>`.
+Options:
+
+- `--style circle` (default) — white-background avatar cropped into a circle, top-right.
+- `--style cutout` — transparent avatar, only her outline on the slide, standing on the bottom edge (bottom-right). Renders go to `avatar_videos_transparent/` (WebM) and take about 2x longer.
+- `--corner top-right|top-left|bottom-right|bottom-left`, `--size <px>` (circle default `280`, cutout default `400`), `--out <file.mp4>`.
 
 ## Running in Docker
 
