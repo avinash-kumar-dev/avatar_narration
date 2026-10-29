@@ -11,9 +11,14 @@
  *   npm run compose -- <folder> --corner top-left --size 320
  *   npm run compose -- <folder> --style cutout
  *
- * Expected folder layout (slide numbers pair images with audio):
- *   slides_png/slide_1.png ...
- *   audio_en/slide_1.mp3 ...   (or voiceover_per_slide/)
+ * Inputs: a folder of slide images and a folder of per-slide audio, paired by
+ * the number in each file name (slide_1.png / 1.mp3 / page-01.jpg all mean
+ * slide 1). By default both are looked up inside <folder> (slides_png/,
+ * slides/ or images/; audio_en/, voiceover_per_slide/, audio/ or voiceover/);
+ * --slides and --audio point anywhere else. Slides that are not 16:9 are
+ * letterboxed, not stretched. Everything generated goes into <folder>.
+ *
+ *   npm run compose -- <folder> --slides ~/deck/images --audio ~/deck/narration
  *
  * Steps, each skipped when its output already exists:
  *   1. loudness-normalize each audio  -> <audio dir>_loud/
@@ -28,7 +33,7 @@ import { execFile } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { basename, join, resolve } from 'node:path'
+import { basename, extname, join, resolve } from 'node:path'
 import { promisify } from 'node:util'
 import { parseArgs } from 'node:util'
 import ffmpegInstaller from '@ffmpeg-installer/ffmpeg'
@@ -41,7 +46,10 @@ const OUT_H = 1080
 const FPS = 25
 /** Same settings as the course batches the avatar looked best with. */
 const LOUDNORM = 'loudnorm=I=-16:TP=-3:LRA=11'
-const AUDIO_DIRS = ['audio_en', 'voiceover_per_slide']
+const SLIDE_DIRS = ['slides_png', 'slides', 'images']
+const AUDIO_DIRS = ['audio_en', 'voiceover_per_slide', 'audio', 'voiceover']
+const IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.webp']
+const AUDIO_EXTS = ['.mp3', '.wav', '.m4a', '.aac', '.ogg', '.opus', '.flac']
 const CORNERS = ['top-right', 'top-left', 'bottom-right', 'bottom-left'] as const
 type Corner = (typeof CORNERS)[number]
 const STYLES = ['circle', 'cutout'] as const
@@ -55,13 +63,22 @@ const { values, positionals } = parseArgs({
     /** Avatar size: the circle diameter (circle) or 280 = the circle's scale (cutout), in 1920x1080 pixels. */
     size: { type: 'string' },
     out: { type: 'string' },
+    slides: { type: 'string' },
+    audio: { type: 'string' },
+    /** Fills the bars around a slide that is not 16:9. */
+    'pad-color': { type: 'string', default: 'white' },
   },
 })
 
 const folder = positionals[0] ? resolve(positionals[0]) : undefined
 if (!folder) {
-  fail('usage: npm run compose -- <course folder> [--style circle|cutout] [--corner top-right] [--size 280] [--out file.mp4]')
+  fail(
+    'usage: npm run compose -- <folder> [--slides <dir>] [--audio <dir>] [--style circle|cutout] ' +
+      '[--corner top-right] [--size 280] [--pad-color white] [--out file.mp4]',
+  )
 }
+const padColor = values['pad-color']!
+if (!/^(#[0-9a-fA-F]{6}|[a-z]+)$/.test(padColor)) fail('--pad-color must be a color name or #rrggbb')
 const style = values.style as Style
 if (!STYLES.includes(style)) fail(`--style must be one of ${STYLES.join(', ')}`)
 const cutout = style === 'cutout'
@@ -74,12 +91,9 @@ if (!Number.isInteger(diameter) || diameter < 80 || diameter > 1000) fail('--siz
 const apiUrl = (process.env.API_URL ?? 'http://127.0.0.1:3000').replace(/\/$/, '')
 const apiKey = process.env.API_KEY
 
-const slidesDir = join(folder, 'slides_png')
-const audioDirName = AUDIO_DIRS.find((d) => existsSync(join(folder, d)))
-if (!existsSync(slidesDir)) fail(`no slides_png/ in ${folder}`)
-if (!audioDirName) fail(`no audio folder (${AUDIO_DIRS.join(' or ')}) in ${folder}`)
-const audioDir = join(folder, audioDirName)
-const loudDir = join(folder, `${audioDirName}_loud`)
+const slidesDir = inputDir(values.slides, SLIDE_DIRS, 'slides')
+const audioDir = inputDir(values.audio, AUDIO_DIRS, 'audio')
+const loudDir = join(folder, `${basename(audioDir)}_loud`)
 const avatarDir = join(folder, cutout ? 'avatar_videos_transparent' : 'avatar_videos_loud')
 const avatarExt = cutout ? 'webm' : 'mp4'
 const outPath = values.out ? resolve(values.out) : join(folder, `${basename(folder)}_avatar.mp4`)
@@ -118,7 +132,10 @@ try {
   for (const s of slides) {
     const seconds = await durationOf(s.avatar)
     const seg = join(work, `seg_${s.n}.mp4`)
-    const bg = `[0:v]scale=${OUT_W}:${OUT_H},setsar=1,fps=${FPS}[bg];`
+    // Fit inside the frame and pad the rest, so a 4:3 or portrait slide is not stretched.
+    const bg =
+      `[0:v]scale=${OUT_W}:${OUT_H}:force_original_aspect_ratio=decrease,` +
+      `pad=${OUT_W}:${OUT_H}:(ow-iw)/2:(oh-ih)/2:color=${padColor},setsar=1,fps=${FPS}[bg];`
     const place = `[bg][c]overlay=${g.x}:${g.y}:eof_action=endall,format=yuv420p[v]`
     const avatarInput = cutout
       ? // ffmpeg's built-in VP9 decoder drops the alpha plane; libvpx keeps it.
@@ -164,27 +181,57 @@ interface Slide {
   avatar: string
 }
 
-/** Pairs slide_N.png with slide_N.<audio>, by slide number. */
+/** The --slides/--audio folder if given, else the first conventional one inside <folder>. */
+function inputDir(given: string | undefined, conventional: string[], what: string): string {
+  if (given) {
+    const dir = resolve(given)
+    if (!existsSync(dir)) fail(`--${what} folder does not exist: ${dir}`)
+    return dir
+  }
+  const name = conventional.find((d) => existsSync(join(folder!, d)))
+  if (!name) fail(`no ${what} folder in ${folder} (looked for ${conventional.join(', ')}); pass --${what} <dir>`)
+  return join(folder!, name)
+}
+
+/**
+ * Files in `dir` with one of `exts`, keyed by the last number in their name
+ * (slide_1.png, 01.png, "Slide 1.png" are all slide 1).
+ */
+async function byNumber(dir: string, exts: string[], what: string): Promise<Map<number, string>> {
+  const found = new Map<number, string>()
+  for (const f of (await readdir(dir)).sort()) {
+    const ext = extname(f).toLowerCase()
+    if (!exts.includes(ext) || f.startsWith('.')) continue
+    const digits = basename(f, extname(f)).match(/\d+/g)
+    if (!digits) {
+      console.log(`skipping ${what} without a number in its name: ${f}`)
+      continue
+    }
+    const n = Number(digits[digits.length - 1])
+    if (found.has(n)) fail(`two ${what} files for number ${n}: ${found.get(n)} and ${f}`)
+    found.set(n, f)
+  }
+  return found
+}
+
+/** Pairs every slide image with the audio file of the same number. */
 async function pairSlides(): Promise<Slide[]> {
-  const num = (f: string) => Number(/slide_(\d+)\./.exec(f)?.[1] ?? NaN)
-  const audios = new Map((await readdir(audioDir)).filter((f) => !Number.isNaN(num(f))).map((f) => [num(f), f]))
-  const pngs = (await readdir(slidesDir)).filter((f) => f.endsWith('.png') && !Number.isNaN(num(f)))
-  const slides = pngs
-    .map((f) => {
-      const n = num(f)
-      const audio = audios.get(n)
-      if (!audio) fail(`slide ${n} has no audio in ${audioDir}`)
-      return {
-        n,
-        slide: join(slidesDir, f),
-        audio: join(audioDir, audio),
-        loud: join(loudDir, `slide_${n}.mp3`),
-        avatar: join(avatarDir, `slide_${n}.${avatarExt}`),
-      }
-    })
-    .sort((a, b) => a.n - b.n)
-  if (slides.length === 0) fail(`no slide_N.png files in ${slidesDir}`)
-  return slides
+  const images = await byNumber(slidesDir, IMAGE_EXTS, 'slide')
+  const audios = await byNumber(audioDir, AUDIO_EXTS, 'audio')
+  if (images.size === 0) fail(`no slide images (${IMAGE_EXTS.join(' ')}) in ${slidesDir}`)
+  const missing = [...images.keys()].filter((n) => !audios.has(n))
+  if (missing.length > 0) fail(`no audio in ${audioDir} for slide(s) ${missing.join(', ')}`)
+  for (const n of audios.keys()) if (!images.has(n)) console.log(`ignoring audio ${audios.get(n)}: no slide ${n}`)
+
+  return [...images.entries()]
+    .sort(([a], [b]) => a - b)
+    .map(([n, image]) => ({
+      n,
+      slide: join(slidesDir, image),
+      audio: join(audioDir, audios.get(n)!),
+      loud: join(loudDir, `slide_${n}.mp3`),
+      avatar: join(avatarDir, `slide_${n}.${avatarExt}`),
+    }))
 }
 
 /**

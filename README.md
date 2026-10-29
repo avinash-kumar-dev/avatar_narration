@@ -92,11 +92,17 @@ For a plain MP4 that any editor can key out, use a green background instead: `-F
 
 `npm run compose` turns a folder of slides and per-slide audio into one video: each slide full screen, the avatar in a circle in a corner, hard cuts between slides.
 
+Slides are paired with audio by the **number in each file name**, so any naming works: `slide_1.png`, `1.png`, `Slide 01.jpg` and `page-1.webp` are all slide 1. Slide images: png, jpg, jpeg, webp (any size; non-16:9 slides are padded, not stretched). Audio: mp3, wav, m4a, aac, ogg, opus, flac. Every slide needs an audio file with the same number.
+
+By default both folders are looked up inside the course folder:
+
 ```
 <course folder>/
-  slides_png/slide_1.png, slide_2.png, ...
-  audio_en/slide_1.mp3, slide_2.mp3, ...      (or voiceover_per_slide/)
+  slides_png/   (or slides/, images/)
+  audio_en/     (or voiceover_per_slide/, audio/, voiceover/)
 ```
+
+Or point at them anywhere with `--slides` and `--audio`; everything generated still goes into the course folder.
 
 **1. Start the avatar service** (terminal 1; stepped mode is required for `--style cutout`):
 
@@ -115,6 +121,9 @@ API_URL=http://127.0.0.1:3000 API_KEY=$API_KEY npm run compose -- "path/to/cours
 # transparent cutout avatar, bottom-right
 API_URL=http://127.0.0.1:3000 API_KEY=$API_KEY npm run compose -- "path/to/course folder" --style cutout
 
+# slides and audio in other folders, any file names
+API_URL=http://127.0.0.1:3000 API_KEY=$API_KEY npm run compose -- "path/to/work folder" --slides ~/deck/images --audio ~/deck/narration
+
 # custom corner / size / output file
 API_URL=http://127.0.0.1:3000 API_KEY=$API_KEY npm run compose -- "path/to/course folder" --corner top-left --size 320 --out course.mp4
 ```
@@ -123,7 +132,7 @@ API_URL=http://127.0.0.1:3000 API_KEY=$API_KEY npm run compose -- "path/to/cours
 
 Steps, each skipped when its output already exists (so a re-run costs nothing):
 
-1. normalizes each audio's loudness → `audio_en_loud/`
+1. normalizes each audio's loudness → `<audio folder name>_loud/`
 2. renders each missing avatar video through the service → `avatar_videos_loud/` (circle) or `avatar_videos_transparent/` (cutout); spends Spatius credits
 3. composites and joins the slides → `<folder name>_avatar.mp4` (1920x1080)
 
@@ -132,6 +141,8 @@ Options:
 - `--style circle` (default) — white-background avatar cropped into a circle, top-right.
 - `--style cutout` — transparent avatar, only her outline on the slide, standing on the bottom edge (bottom-right). Renders go to `avatar_videos_transparent/` (WebM) and take about 2x longer.
 - `--corner top-right|top-left|bottom-right|bottom-left`, `--size <px>` (circle default `280`, cutout default `400`), `--out <file.mp4>`.
+- `--slides <dir>`, `--audio <dir>` — input folders, if not inside the course folder.
+- `--pad-color <name|#rrggbb>` — color of the bars around a non-16:9 slide (default `white`).
 
 ## Running in Docker
 
