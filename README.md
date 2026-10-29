@@ -98,15 +98,33 @@ For a plain MP4 that any editor can key out, use a green background instead: `-F
   audio_en/slide_1.mp3, slide_2.mp3, ...      (or voiceover_per_slide/)
 ```
 
+**1. Start the avatar service** (terminal 1; stepped mode is required for `--style cutout`):
+
 ```bash
-# the avatar service must be running only if some avatar videos still have to be made
-API_URL=http://127.0.0.1:3000 API_KEY=$API_KEY npm run compose -- "path/to/course folder"
+RENDER_MODE=stepped npm start
 ```
+
+Not needed if every avatar video for the folder already exists.
+
+**2. Build the course video** (terminal 2; `API_KEY` = the service's `API_KEY` from `.env`):
+
+```bash
+# circle avatar, top-right
+API_URL=http://127.0.0.1:3000 API_KEY=$API_KEY npm run compose -- "path/to/course folder"
+
+# transparent cutout avatar, bottom-right
+API_URL=http://127.0.0.1:3000 API_KEY=$API_KEY npm run compose -- "path/to/course folder" --style cutout
+
+# custom corner / size / output file
+API_URL=http://127.0.0.1:3000 API_KEY=$API_KEY npm run compose -- "path/to/course folder" --corner top-left --size 320 --out course.mp4
+```
+
+**3. Stop the service** with Ctrl+C in terminal 1.
 
 Steps, each skipped when its output already exists (so a re-run costs nothing):
 
 1. normalizes each audio's loudness → `audio_en_loud/`
-2. renders each avatar video through the service → `avatar_videos_loud/` (spends Spatius credits)
+2. renders each missing avatar video through the service → `avatar_videos_loud/` (circle) or `avatar_videos_transparent/` (cutout); spends Spatius credits
 3. composites and joins the slides → `<folder name>_avatar.mp4` (1920x1080)
 
 Options:
